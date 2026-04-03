@@ -1,0 +1,88 @@
+# Zeeble Cloud - Docker Compose
+# Hosted server management + file storage
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+
+services:
+  # ── ZCloud Hosted Server ──────────────────────────────────────────────────
+  zcloud:
+    build:
+      context: ../zeeble-gate/zcloud
+      dockerfile: Dockerfile
+    container_name: zeeble-cloud
+    environment:
+      PORT: "3003"
+      DATABASE_URL: postgres://zeeble:${POSTGRES_PASSWORD:-zeeble}@postgres:5432/zeeble_cloud
+      AUTH_SERVER_URL: ${AUTH_SERVER_URL:-http://host.docker.internal:3001}
+      ZCLOUD_BASE_URL: ${ZCLOUD_BASE_URL:-https://cloud.zeeble.xyz}
+      ZCLOUD_MAX_MESSAGE_LEN: ${ZCLOUD_MAX_MESSAGE_LEN:-2000}
+      ZCLOUD_MAX_CHANNELS: ${ZCLOUD_MAX_CHANNELS:-50}
+      ZCLOUD_MAX_MEMBERS: ${ZCLOUD_MAX_MEMBERS:-500}
+      ZCLOUD_MAX_ATTACHMENT_MB: ${ZCLOUD_MAX_ATTACHMENT_MB:-100}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3003/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - zeeble-cloud-net
+
+  # ── Caddy Reverse Proxy (rack only — not needed for tunnel/dev) ──────────
+  caddy:
+    profiles: [rack]
+    image: caddy:2-alpine
+    container_name: zeeble-cloud-caddy
+    ports:
+      - "${HTTP_PORT:-9080}:9080"
+      - "${HTTPS_PORT:-9443}:9443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./certs:/certs:ro
+    environment:
+      HTTP_PORT: ${HTTP_PORT:-9080}
+      HTTPS_PORT: ${HTTPS_PORT:-9443}
+      TLS_CERT: ${TLS_CERT:-/certs/fullchain.pem}
+      TLS_KEY: ${TLS_KEY:-/certs/privkey.pem}
+    depends_on:
+      - zcloud
+    restart: unless-stopped
+    networks:
+      - zeeble-cloud-net
+
+  # ── PostgreSQL Database ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: zeeble-cloud-postgres
+    environment:
+      POSTGRES_USER: zeeble
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zeeble}
+      POSTGRES_DB: zeeble_cloud
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeeble -d zeeble_cloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - zeeble-cloud-net
+
+networks:
+  zeeble-cloud-net:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:
