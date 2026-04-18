@@ -1,9 +1,13 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+const WS_RATE_LIMIT_MSGS: u32 = 20;
+const WS_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5);
 
 use crate::AppState;
 
@@ -46,6 +50,9 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
     let mut user_id: Option<String> = None;       // uid (UUID) — used as connection key
     let mut beam_identity: Option<String> = None; // sub — used for display / message authorship
     let mut subscribed_channels: Vec<Uuid> = Vec::new();
+
+    let mut rate_msg_count: u32 = 0;
+    let mut rate_window_start = Instant::now();
 
     while let Some(msg) = receiver.next().await {
         let text = match msg {
@@ -103,6 +110,17 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
 
             InMsg::Message { channel_id, content, title, reply_to } => {
                 if !authenticated { continue; }
+
+                let now = Instant::now();
+                if now.duration_since(rate_window_start) >= WS_RATE_LIMIT_WINDOW {
+                    rate_msg_count = 0;
+                    rate_window_start = now;
+                }
+                rate_msg_count += 1;
+                if rate_msg_count > WS_RATE_LIMIT_MSGS {
+                    let _ = tx.send(r#"{"type":"error","message":"rate limited"}"#.to_string());
+                    continue;
+                }
                 let (Some(uid), Some(bident), Ok(cid)) = (
                     user_id.clone(),
                     beam_identity.clone(),
