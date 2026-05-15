@@ -29,28 +29,8 @@ services:
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
       PORT: 8003
       RUST_LOG: zcloud=info,tower_http=debug
-      LIVEKIT_URL: http://livekit:7880
-      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-zeeble-dev-key}
-      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-change-me-livekit-secret-min-32-chars}
     depends_on:
       - postgres
-      - livekit
-    networks:
-      - zcloud-net
-    restart: unless-stopped
-
-  # ── LiveKit (Voice/Video) ─────────────────────────────────────────────────────
-  livekit:
-    image: livekit/livekit-server:latest
-    command: --bind 0.0.0.0 --config /livekit.yaml
-    ports:
-      - "7880:7880"
-      - "7881:7881"
-      - "7882:7882/udp"
-    environment:
-      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-zeeble-dev-key}: ${LIVEKIT_API_SECRET:-change-me-livekit-secret-min-32-chars}"
-    volumes:
-      - ./livekit.yaml:/livekit.yaml
     networks:
       - zcloud-net
     restart: unless-stopped

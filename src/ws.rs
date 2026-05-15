@@ -76,14 +76,26 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
                         authenticated = true;
                         let uid = claims.uid.clone();
                         let sub = claims.sub.clone();
+                        let dname = claims.display_name.clone();
                         user_id = Some(uid.clone());
-                        beam_identity = Some(sub);
+                        beam_identity = Some(sub.clone());
 
-                        state.connections.write().await
-                            .users.insert(uid.clone(), tx.clone());
+                        {
+                            let mut conns = state.connections.write().await;
+                            conns.users.insert(uid.clone(), tx.clone());
+                            conns.online_beams.insert(sub.clone());
+                        }
+
+                        // Persist display_name so the members list can show it
+                        if let Some(ref dn) = dname {
+                            let _ = state.db.execute(
+                                "UPDATE server_members SET display_name = $1 WHERE server_id = $2 AND user_id = $3",
+                                &[dn, &server_id, &sub],
+                            ).await;
+                        }
 
                         let _ = tx.send(r#"{"type":"auth_ok"}"#.to_string());
-                        info!("zcloud WS auth ok: {uid} on server {server_id}");
+                        info!("zcloud WS auth ok: {uid} ({sub}) on server {server_id}");
                     }
                     Err(e) => {
                         let _ = tx.send(
@@ -178,6 +190,9 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
     if let Some(uid) = user_id {
         let mut conns = state.connections.write().await;
         conns.users.remove(&uid);
+        if let Some(ref beam) = beam_identity {
+            conns.online_beams.remove(beam);
+        }
         for cid in subscribed_channels {
             if let Some(subs) = conns.channel_subs.get_mut(&(server_id, cid)) {
                 subs.remove(&uid);

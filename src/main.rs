@@ -1,5 +1,5 @@
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, patch, post},
     Router,
     extract::{State, WebSocketUpgrade},
     response::IntoResponse,
@@ -14,7 +14,6 @@ use tracing::{info, error};
 use uuid::Uuid;
 
 mod servers;
-mod voice;
 mod ws;
 
 #[derive(Clone)]
@@ -29,6 +28,7 @@ pub struct AppState {
 pub struct Connections {
     pub users: HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>,
     pub channel_subs: HashMap<(Uuid, Uuid), HashSet<String>>,
+    pub online_beams: HashSet<String>,
 }
 
 #[tokio::main]
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("zcloud=info".parse()?)
+                .add_directive("zcloud=debug".parse()?)
         )
         .init();
 
@@ -87,10 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health))
         // Cloud server management
         .route("/servers", post(servers::create_server))
+        .route("/servers/:id", delete(servers::delete_server))
         // Per-server v1 API (client base URL = https://cloud.zeeble.xyz/servers/:id)
         .route("/servers/:id/health",          get(servers::server_health))
         .route("/servers/:id/v1/server/info",  get(servers::server_info))
-        .route("/servers/:id/v1/channels",     get(servers::get_channels_v1))
+        .route("/servers/:id/v1/channels",     get(servers::get_channels_v1).post(servers::create_channel_v1))
+        .route("/servers/:id/v1/channels/:channel_id", patch(servers::update_channel_v1).delete(servers::delete_channel_v1))
         .route("/servers/:id/v1/members",      get(servers::get_members_v1))
         .route("/servers/:id/v1/categories",   get(servers::get_categories))
         .route("/servers/:id/v1/custom_roles", get(servers::get_custom_roles))
@@ -101,13 +103,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/servers/:id/v1/channels/:channel_id/posts/:post_id/replies", get(servers::get_post_replies))
         .route("/servers/:id/v1/upload",                        post(servers::upload_file))
         .route("/servers/:id/v1/attachments/:attach_id",        get(servers::get_attachment))
-        // Legacy token endpoint
-        .route("/livekit/token", post(voice::get_livekit_token))
+        // Invites
+        .route("/servers/:id/v1/invites",                       get(servers::list_invites).post(servers::create_invite))
+        .route("/servers/:id/v1/invites/:code",                 get(servers::validate_invite).delete(servers::delete_invite))
+        .route("/servers/:id/v1/invites/:code/redeem",          post(servers::redeem_invite))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
+    spawn_heartbeat("cloud");
+
     info!("zcloud listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -124,6 +130,31 @@ async fn ws_upgrade_handler(
 
 async fn health() -> &'static str {
     "ok"
+}
+
+fn spawn_heartbeat(key: &'static str) {
+    let url = std::env::var("ZSTATUS_URL")
+        .unwrap_or_else(|_| "http://zstatus:8004".to_string());
+    let secret = std::env::var("ZSTATUS_SECRET").unwrap_or_default();
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("heartbeat client");
+        let endpoint = format!("{}/heartbeat", url);
+        loop {
+            let body = serde_json::json!({ "key": key, "ok": true });
+            let mut req = client.post(&endpoint).json(&body);
+            if !secret.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", secret));
+            }
+            if let Err(e) = req.send().await {
+                tracing::warn!("[heartbeat] zstatus unreachable: {e}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
 }
 
 async fn fetch_ed25519_x(zbeam_url: &str) -> String {
@@ -194,6 +225,16 @@ async fn init_database(db: &tokio_postgres::Client) -> Result<(), tokio_postgres
         CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to);
 
+        CREATE TABLE IF NOT EXISTS invites (
+            code TEXT PRIMARY KEY,
+            server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+            created_by TEXT NOT NULL,
+            max_uses INTEGER,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         CREATE TABLE IF NOT EXISTS attachments (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
@@ -204,5 +245,9 @@ async fn init_database(db: &tokio_postgres::Client) -> Result<(), tokio_postgres
             uploaded_by TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+
+        ALTER TABLE server_members ADD COLUMN IF NOT EXISTS display_name TEXT;
+
+        UPDATE server_members SET display_name = NULL WHERE user_id = 'd0e5b178-ddca-489e-8772-1d5246b4fcf7' AND display_name = 'creeper7';
     ").await
 }
