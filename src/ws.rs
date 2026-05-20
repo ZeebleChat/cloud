@@ -1,9 +1,10 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const WS_RATE_LIMIT_MSGS: u32 = 20;
@@ -29,7 +30,7 @@ enum InMsg {
     #[serde(rename = "join")]
     Join { channel_id: String },
     #[serde(rename = "message")]
-    Message { channel_id: String, content: String, title: Option<String>, reply_to: Option<String> },
+    Message { channel_id: String, content: String, title: Option<String>, reply_to: Option<String>, attachment_id: Option<String> },
     #[serde(rename = "ping")]
     Ping,
 }
@@ -86,12 +87,15 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
                             conns.online_beams.insert(sub.clone());
                         }
 
-                        // Persist display_name so the members list can show it
                         if let Some(ref dn) = dname {
-                            let _ = state.db.execute(
+                            let _ = sqlx::query(
                                 "UPDATE server_members SET display_name = $1 WHERE server_id = $2 AND user_id = $3",
-                                &[dn, &server_id, &sub],
-                            ).await;
+                            )
+                            .bind(dn)
+                            .bind(server_id)
+                            .bind(&sub)
+                            .execute(&state.db)
+                            .await;
                         }
 
                         let _ = tx.send(r#"{"type":"auth_ok"}"#.to_string());
@@ -120,7 +124,7 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
                 }
             }
 
-            InMsg::Message { channel_id, content, title, reply_to } => {
+            InMsg::Message { channel_id, content, title, reply_to, attachment_id } => {
                 if !authenticated { continue; }
 
                 let now = Instant::now();
@@ -145,17 +149,65 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok());
 
-                let row = state.db.query_one(
+                let row = sqlx::query(
                     "INSERT INTO messages (channel_id, beam_identity, content, title, reply_to)
                      VALUES ($1, $2, $3, $4, $5)
                      RETURNING id, created_at",
-                    &[&cid, &bident, &content, &title, &reply_to_uuid],
-                ).await;
+                )
+                .bind(cid)
+                .bind(&bident)
+                .bind(&content)
+                .bind(&title)
+                .bind(reply_to_uuid)
+                .fetch_one(&state.db)
+                .await;
 
-                if let Ok(row) = row {
+                match row {
+                  Err(e) => { error!("DB insert message: {e}"); continue; }
+                  Ok(row) => {
                     let msg_id: uuid::Uuid = row.get("id");
                     let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
                     let _ = uid;
+
+                    // Link the uploaded attachment to this message and fetch its metadata
+                    let att_value: Option<serde_json::Value> = if let Some(att_id_str) = &attachment_id {
+                        if let Ok(att_id) = Uuid::parse_str(att_id_str) {
+                            match sqlx::query(
+                                "UPDATE attachments SET message_id = $1
+                                 WHERE id = $2 AND server_id = $3
+                                 RETURNING id, filename, mime_type, file_size",
+                            )
+                            .bind(msg_id)
+                            .bind(att_id)
+                            .bind(server_id)
+                            .fetch_optional(&state.db)
+                            .await
+                            {
+                                Ok(Some(r)) => {
+                                    let id: Uuid = r.get("id");
+                                    let filename: String = r.get("filename");
+                                    let mime: String = r.get("mime_type");
+                                    let size: i64 = r.get("file_size");
+                                    Some(serde_json::json!({
+                                        "id": id,
+                                        "filename": filename,
+                                        "content_type": mime,
+                                        "size": size
+                                    }))
+                                }
+                                Ok(None) => { warn!("attachment {att_id_str} not found for server {server_id}"); None }
+                                Err(e) => { error!("link attachment: {e}"); None }
+                            }
+                        } else {
+                            warn!("invalid attachment_id: {att_id_str}");
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let attachments: Vec<serde_json::Value> = att_value.into_iter().collect();
+
                     let broadcast = serde_json::json!({
                         "type": "message",
                         "id": msg_id,
@@ -165,7 +217,7 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
                         "title": title,
                         "reply_to": reply_to_uuid,
                         "created_at": created_at.to_rfc3339(),
-                        "attachments": []
+                        "attachments": attachments
                     }).to_string();
 
                     let key = (server_id, cid);
@@ -177,6 +229,7 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
                             }
                         }
                     }
+                  }
                 }
             }
 
