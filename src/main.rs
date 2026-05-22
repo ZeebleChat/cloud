@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Per-server v1 API (client base URL = https://cloud.zeeble.xyz/servers/:id)
         .route("/servers/:id/health",          get(servers::server_health))
         .route("/servers/:id/v1/server/info",     get(servers::server_info))
-        .route("/servers/:id/v1/server/settings", patch(servers::patch_server_settings))
+        .route("/servers/:id/v1/server/settings", get(servers::get_server_settings).patch(servers::patch_server_settings))
         .route("/servers/:id/v1/channels",     get(servers::get_channels_v1).post(servers::create_channel_v1))
         .route("/servers/:id/v1/channels/:channel_id", patch(servers::update_channel_v1).delete(servers::delete_channel_v1))
         .route("/servers/:id/v1/members",      get(servers::get_members_v1))

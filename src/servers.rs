@@ -31,7 +31,6 @@ pub struct OffsetQuery {
 pub struct CreateServerRequest {
     pub name: String,
     pub about: Option<String>,
-    pub owner_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,13 +82,17 @@ pub async fn delete_server(
 
 pub async fn create_server(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CreateServerRequest>,
 ) -> Result<(StatusCode, Json<ServerResponse>), StatusCode> {
+    let claims = require_auth_sync(&headers, &state.ed25519_x)?;
+    let owner_id = &claims.sub;
+
     let row = sqlx::query(
         "INSERT INTO servers (name, owner_id, about) VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(&payload.name)
-    .bind(&payload.owner_id)
+    .bind(owner_id)
     .bind(&payload.about)
     .fetch_one(&state.db)
     .await
@@ -97,15 +100,13 @@ pub async fn create_server(
 
     let server_id: Uuid = row.get("id");
 
-    let owner_display_name: Option<String> = payload.owner_id
-        .split('»')
-        .next()
-        .map(|s| s.to_string());
+    let owner_display_name: Option<String> = claims.display_name.clone()
+        .or_else(|| owner_id.split('»').next().map(|s| s.to_string()));
     sqlx::query(
         "INSERT INTO server_members (server_id, user_id, role, display_name) VALUES ($1, $2, 'owner', $3)",
     )
     .bind(server_id)
-    .bind(&payload.owner_id)
+    .bind(owner_id)
     .bind(&owner_display_name)
     .execute(&state.db)
     .await
@@ -218,7 +219,9 @@ pub struct ServerInfoResponse {
 pub async fn server_info(
     State(state): State<AppState>,
     Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<ServerInfoResponse>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
     let row = sqlx::query(
         "SELECT name, about, owner_id, logo_attachment_id, banner_attachment_id
          FROM servers WHERE id = $1",
@@ -306,6 +309,56 @@ pub async fn patch_server_settings(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn get_server_settings(
+    State(state): State<AppState>,
+    Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let token = extract_bearer(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let claims = validate_jwt(&token, &state.ed25519_x).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let row = sqlx::query("SELECT name, about, owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| { error!("zcloud get_server_settings error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let owner_id: String = row.get("owner_id");
+    if claims.sub != owner_id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let name: String = row.get("name");
+    let about: Option<String> = row.get("about");
+    let public_url = format!("{}/servers/{}", state.public_url.trim_end_matches('/'), server_id);
+
+    Ok(Json(serde_json::json!({
+        "server_name": name,
+        "public_url": public_url,
+        "owner_beam_identity": owner_id,
+        "about": about,
+        "max_message_length": 4000,
+        "max_upload_size": "8MB",
+        "invites_anyone_can_create": true,
+        "default_invite_expiry_hours": 24,
+        "default_invite_max_uses": 0,
+        "allow_new_members": true,
+        "logo_attachment_id": null,
+        "banner_attachment_id": null,
+        "require_email_verified": false,
+        "require_phone_verified": false,
+        "require_age_18_plus": false,
+        "age_proof_methods": [],
+        "allow_bots": true,
+        "min_account_age_days": 0,
+        "identity_whitelist": [],
+        "identity_blacklist": [],
+        "allowed_email_domains": [],
+        "max_members": 0
+    })))
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiChannel {
     pub id: Uuid,
@@ -319,7 +372,9 @@ pub struct ApiChannel {
 pub async fn get_channels_v1(
     State(state): State<AppState>,
     Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<ApiChannel>>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
     let rows = sqlx::query(
         "SELECT id, name, channel_type, position, topic
          FROM channels WHERE server_id = $1 ORDER BY position, name LIMIT 500",
@@ -510,8 +565,10 @@ pub async fn delete_channel_v1(
 pub async fn get_members_v1(
     State(state): State<AppState>,
     Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
     Query(q): Query<OffsetQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let offset = q.offset.unwrap_or(0).max(0);
     tracing::debug!("get_members_v1: server_id={} limit={} offset={}", server_id, limit, offset);
@@ -521,21 +578,30 @@ pub async fn get_members_v1(
 }
 
 pub async fn get_categories(
-    Path(_server_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
-    Json(json!({ "categories": [] }))
+    State(state): State<AppState>,
+    Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
+    Ok(Json(json!({ "categories": [] })))
 }
 
 pub async fn get_custom_roles(
-    Path(_server_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
-    Json(json!([]))
+    State(state): State<AppState>,
+    Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
+    Ok(Json(json!([])))
 }
 
 pub async fn get_voice_rooms(
-    Path(_server_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
-    Json(json!({ "rooms": [] }))
+    State(state): State<AppState>,
+    Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
+    Ok(Json(json!({ "rooms": [] })))
 }
 
 #[derive(Debug, Serialize)]
@@ -594,8 +660,10 @@ async fn verify_channel(db: &PgPool, channel_id: Uuid, server_id: Uuid) -> Resul
 pub async fn get_messages(
     State(state): State<AppState>,
     Path((server_id, channel_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
     Query(q): Query<MessageQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
     verify_channel(&state.db, channel_id, server_id).await?;
 
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
@@ -638,8 +706,10 @@ pub async fn get_messages(
 pub async fn get_board_posts(
     State(state): State<AppState>,
     Path((server_id, channel_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
     Query(q): Query<OffsetQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
     verify_channel(&state.db, channel_id, server_id).await?;
 
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
@@ -668,8 +738,10 @@ pub async fn get_board_posts(
 pub async fn get_post_replies(
     State(state): State<AppState>,
     Path((server_id, channel_id, post_id)): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
     Query(q): Query<OffsetQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
     verify_channel(&state.db, channel_id, server_id).await?;
 
     let limit = q.limit.unwrap_or(100).clamp(1, 200);
@@ -699,7 +771,9 @@ pub async fn get_post_replies(
 pub async fn server_health(
     State(state): State<AppState>,
     Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth_sync(&headers, &state.ed25519_x)?;
     let exists = sqlx::query("SELECT id FROM servers WHERE id = $1")
         .bind(server_id)
         .fetch_optional(&state.db)
@@ -738,6 +812,23 @@ fn validate_jwt(token: &str, ed25519_x: &str) -> Result<Claims, ()> {
     let mut val = Validation::new(Algorithm::EdDSA);
     val.validate_aud = false;
     decode::<Claims>(token, &key, &val).map(|d| d.claims).map_err(|_| ())
+}
+
+fn require_auth_sync(headers: &HeaderMap, ed25519_x: &str) -> Result<Claims, StatusCode> {
+    let token = extract_bearer(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    validate_jwt(&token, ed25519_x).map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
+async fn require_member(state: &AppState, headers: &HeaderMap, server_id: Uuid) -> Result<Claims, StatusCode> {
+    let claims = require_auth_sync(headers, &state.ed25519_x)?;
+    sqlx::query("SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2")
+        .bind(server_id)
+        .bind(&claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| { error!("zcloud require_member: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?
+        .ok_or(StatusCode::FORBIDDEN)?;
+    Ok(claims)
 }
 
 pub async fn upload_file(
