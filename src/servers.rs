@@ -69,7 +69,28 @@ pub struct ServerMember {
 pub async fn delete_server(
     State(state): State<AppState>,
     Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> StatusCode {
+    let claims = match require_auth_sync(&headers, &state.ed25519_x) {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+
+    let row = sqlx::query("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_optional(&state.db)
+        .await;
+
+    let owner_id: String = match row {
+        Ok(Some(r)) => r.get("owner_id"),
+        Ok(None) => return StatusCode::NOT_FOUND,
+        Err(e) => { error!("zcloud delete_server error: {e}"); return StatusCode::INTERNAL_SERVER_ERROR; }
+    };
+
+    if claims.sub != owner_id {
+        return StatusCode::FORBIDDEN;
+    }
+
     match sqlx::query("DELETE FROM servers WHERE id = $1")
         .bind(server_id)
         .execute(&state.db)
@@ -199,7 +220,9 @@ async fn query_members(
 pub async fn get_server_members(
     State(state): State<AppState>,
     Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<ServerMember>>, StatusCode> {
+    require_member(&state, &headers, server_id).await?;
     let (members, _) = query_members(&state, server_id, 1000, 0).await?;
     Ok(Json(members))
 }
