@@ -5,17 +5,20 @@ use axum::{
     response::IntoResponse,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer, AllowOrigin};
 use tower_http::trace::TraceLayer;
 use tracing::{info, error};
 use uuid::Uuid;
 
 mod servers;
+mod voice;
 mod ws;
+
+pub type VoiceChannelBus = Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,6 +26,88 @@ pub struct AppState {
     pub public_url: String,
     pub ed25519_x: String,
     pub connections: Arc<RwLock<Connections>>,
+    // voice / stream state
+    pub voice_buses: VoiceChannelBus,
+    pub stream_buses: VoiceChannelBus,
+    pub stream_broadcasters: Arc<Mutex<HashMap<String, String>>>,
+    pub voice_members: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    pub voice_server_bus: broadcast::Sender<String>,
+    pub redis: redis::aio::ConnectionManager,
+    pub voice_allowed_origins: Vec<String>,
+}
+
+impl AppState {
+    pub fn voice_bus_for(&self, channel_id: &str) -> broadcast::Sender<String> {
+        let mut map = self.voice_buses.lock().unwrap();
+        map.entry(channel_id.to_string())
+            .or_insert_with(|| broadcast::channel::<String>(4096).0)
+            .clone()
+    }
+
+    pub fn stream_bus_for(&self, channel_id: &str) -> broadcast::Sender<String> {
+        let mut map = self.stream_buses.lock().unwrap();
+        map.entry(channel_id.to_string())
+            .or_insert_with(|| broadcast::channel::<String>(4096).0)
+            .clone()
+    }
+
+    pub fn claim_stream(&self, channel_id: &str, identity: &str) -> bool {
+        let mut map = self.stream_broadcasters.lock().unwrap();
+        if map.contains_key(channel_id) {
+            return false;
+        }
+        map.insert(channel_id.to_string(), identity.to_string());
+        true
+    }
+
+    pub fn release_stream(&self, channel_id: &str, identity: &str) {
+        let mut map = self.stream_broadcasters.lock().unwrap();
+        if map.get(channel_id).map(|s| s.as_str()) == Some(identity) {
+            map.remove(channel_id);
+        }
+    }
+
+    pub fn stream_broadcaster(&self, channel_id: &str) -> Option<String> {
+        self.stream_broadcasters.lock().unwrap().get(channel_id).cloned()
+    }
+
+    pub fn voice_join(&self, channel_id: &str, identity: &str) {
+        let mut rooms = self.voice_members.lock().unwrap();
+        rooms
+            .entry(channel_id.to_string())
+            .or_default()
+            .insert(identity.to_string());
+    }
+
+    pub fn voice_leave(&self, channel_id: &str, identity: &str) {
+        let mut rooms = self.voice_members.lock().unwrap();
+        if let Some(members) = rooms.get_mut(channel_id) {
+            members.remove(identity);
+            if members.is_empty() {
+                rooms.remove(channel_id);
+            }
+        }
+    }
+
+    pub fn voice_leave_all(&self, identity: &str) -> Vec<String> {
+        let mut rooms = self.voice_members.lock().unwrap();
+        let mut left = Vec::new();
+        for (channel_id, members) in rooms.iter_mut() {
+            if members.remove(identity) {
+                left.push(channel_id.clone());
+            }
+        }
+        rooms.retain(|_, members| !members.is_empty());
+        left
+    }
+
+    pub fn voice_participants(&self, channel_id: &str) -> Vec<String> {
+        let rooms = self.voice_members.lock().unwrap();
+        rooms
+            .get(channel_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Default)]
@@ -53,6 +138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(8003);
     let zbeam_url = std::env::var("ZBEAM_URL")
         .unwrap_or_else(|_| "http://zbeam:8001".to_string());
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let voice_allowed_origins: Vec<String> = std::env::var("VOICE_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let pool = PgPoolOptions::new()
         .max_connections(20)
@@ -64,11 +157,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ed25519_x = fetch_ed25519_x(&zbeam_url).await;
 
+    let redis_client = redis::Client::open(redis_url.as_str())
+        .unwrap_or_else(|e| panic!("Invalid REDIS_URL '{redis_url}': {e}"));
+    let redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect to Redis at '{redis_url}': {e}"));
+    info!("Redis connected: {redis_url}");
+
+    let (voice_server_bus, _) = broadcast::channel::<String>(256);
+
     let state = AppState {
         db: pool,
         public_url,
         ed25519_x,
         connections: Arc::new(RwLock::new(Connections::default())),
+        voice_buses: Arc::new(Mutex::new(HashMap::new())),
+        stream_buses: Arc::new(Mutex::new(HashMap::new())),
+        stream_broadcasters: Arc::new(Mutex::new(HashMap::new())),
+        voice_members: Arc::new(Mutex::new(HashMap::new())),
+        voice_server_bus,
+        redis: redis_conn,
+        voice_allowed_origins,
     };
 
     let origins: Vec<axum::http::HeaderValue> = cors_origin
@@ -90,8 +199,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/servers/:id/health",          get(servers::server_health))
         .route("/servers/:id/v1/server/info",     get(servers::server_info))
         .route("/servers/:id/v1/server/settings", get(servers::get_server_settings).patch(servers::patch_server_settings))
-        .route("/servers/:id/v1/channels",     get(servers::get_channels_v1).post(servers::create_channel_v1))
-        .route("/servers/:id/v1/channels/:channel_id", patch(servers::update_channel_v1).delete(servers::delete_channel_v1))
+        .route("/servers/:id/v1/channels",                          get(servers::get_channels_v1).post(servers::create_channel_v1))
+        .route("/servers/:id/v1/channels/unread",                   get(servers::get_unread_state))
+        .route("/servers/:id/v1/channels/:channel_id",              patch(servers::update_channel_v1).delete(servers::delete_channel_v1))
+        .route("/servers/:id/v1/channels/:channel_id/read",         post(servers::mark_channel_read))
         .route("/servers/:id/v1/members",      get(servers::get_members_v1))
         .route("/servers/:id/v1/categories",   get(servers::get_categories))
         .route("/servers/:id/v1/custom_roles", get(servers::get_custom_roles))
@@ -108,6 +219,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/servers/:id/v1/invites",                       get(servers::list_invites).post(servers::create_invite))
         .route("/servers/:id/v1/invites/:code",                 get(servers::validate_invite).delete(servers::delete_invite))
         .route("/servers/:id/v1/invites/:code/redeem",          post(servers::redeem_invite))
+        // Voice / stream (from zvoice)
+        .route("/voice/v1/ws",                              get(voice_ws_handler))
+        .route("/voice/v1/voice/rooms",                     get(voice::get_voice_rooms))
+        .route("/voice/v1/voice/participants/:channel_id",  get(voice::get_voice_participants))
+        .route("/voice/v1/streams",                         get(voice::list_streams))
+        .route("/voice/v1/stream/:channel_id",              get(voice::get_stream))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -127,6 +244,14 @@ async fn ws_upgrade_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| ws::handle_connection(socket, state, server_id))
+}
+
+async fn voice_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    voice::ws::ws_handler(ws, state, headers).await
 }
 
 async fn health() -> &'static str {

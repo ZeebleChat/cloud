@@ -100,6 +100,7 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
 
                         let _ = tx.send(r#"{"type":"auth_ok"}"#.to_string());
                         info!("zcloud WS auth ok: {uid} ({sub}) on server {server_id}");
+                        broadcast_member_list(&state, server_id).await;
                     }
                     Err(e) => {
                         let _ = tx.send(
@@ -241,14 +242,62 @@ pub async fn handle_connection(socket: WebSocket, state: AppState, server_id: Uu
 
     // Cleanup on disconnect
     if let Some(uid) = user_id {
-        let mut conns = state.connections.write().await;
-        conns.users.remove(&uid);
-        if let Some(ref beam) = beam_identity {
-            conns.online_beams.remove(beam);
+        {
+            let mut conns = state.connections.write().await;
+            conns.users.remove(&uid);
+            if let Some(ref beam) = beam_identity {
+                conns.online_beams.remove(beam);
+            }
+            for cid in &subscribed_channels {
+                if let Some(subs) = conns.channel_subs.get_mut(&(server_id, *cid)) {
+                    subs.remove(&uid);
+                }
+            }
         }
-        for cid in subscribed_channels {
-            if let Some(subs) = conns.channel_subs.get_mut(&(server_id, cid)) {
-                subs.remove(&uid);
+        broadcast_member_list(&state, server_id).await;
+    }
+}
+
+async fn broadcast_member_list(state: &AppState, server_id: Uuid) {
+    let rows = match sqlx::query(
+        "SELECT user_id, display_name, role FROM server_members WHERE server_id = $1 ORDER BY role, user_id",
+    )
+    .bind(server_id)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => { error!("broadcast_member_list query: {e}"); return; }
+    };
+
+    let online = state.connections.read().await.online_beams.clone();
+
+    let members: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let user_id: String = row.get("user_id");
+        let role: String = row.get("role");
+        let is_owner = role == "owner";
+        let status = if online.contains(&user_id) { "online" } else { "offline" };
+        serde_json::json!({
+            "beam_identity": user_id,
+            "display_name": row.get::<Option<String>, _>("display_name"),
+            "role": role,
+            "is_owner": is_owner,
+            "status": status,
+        })
+    }).collect();
+
+    let msg = serde_json::json!({ "type": "member", "members": members }).to_string();
+
+    let conns = state.connections.read().await;
+    let mut seen = std::collections::HashSet::new();
+    for ((srv_id, _), subs) in &conns.channel_subs {
+        if *srv_id == server_id {
+            for uid in subs {
+                if seen.insert(uid.clone()) {
+                    if let Some(sender) = conns.users.get(uid) {
+                        let _ = sender.send(msg.clone());
+                    }
+                }
             }
         }
     }

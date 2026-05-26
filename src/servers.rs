@@ -217,16 +217,6 @@ async fn query_members(
     Ok((members, has_more))
 }
 
-pub async fn get_server_members(
-    State(state): State<AppState>,
-    Path(server_id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<ServerMember>>, StatusCode> {
-    require_member(&state, &headers, server_id).await?;
-    let (members, _) = query_members(&state, server_id, 1000, 0).await?;
-    Ok(Json(members))
-}
-
 // ── v1 API routes (client uses https://cloud.zeeble.xyz/servers/:id as base) ──
 
 #[derive(Debug, Serialize)]
@@ -1363,6 +1353,60 @@ pub async fn redeem_invite(
         .map_err(|e| { error!("zcloud error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn mark_channel_read(
+    State(state): State<AppState>,
+    Path((server_id, channel_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    let claims = require_auth_sync(&headers, &state.ed25519_x)?;
+    verify_channel(&state.db, channel_id, server_id).await?;
+
+    sqlx::query(
+        "INSERT INTO channel_reads (server_id, channel_id, user_id, last_read_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (server_id, channel_id, user_id)
+         DO UPDATE SET last_read_at = now()",
+    )
+    .bind(server_id)
+    .bind(channel_id)
+    .bind(&claims.sub)
+    .execute(&state.db)
+    .await
+    .map_err(|e| { error!("zcloud mark_channel_read: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn get_unread_state(
+    State(state): State<AppState>,
+    Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let claims = require_auth_sync(&headers, &state.ed25519_x)?;
+
+    let rows = sqlx::query(
+        "SELECT c.id::TEXT
+         FROM channels c
+         LEFT JOIN channel_reads cr
+           ON cr.channel_id = c.id AND cr.server_id = c.server_id AND cr.user_id = $2
+         WHERE c.server_id = $1
+           AND EXISTS (
+             SELECT 1 FROM messages m
+             WHERE m.channel_id = c.id
+               AND m.created_at > COALESCE(cr.last_read_at, '1970-01-01'::TIMESTAMPTZ)
+               AND m.beam_identity != $2
+           )",
+    )
+    .bind(server_id)
+    .bind(&claims.sub)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| { error!("zcloud get_unread_state: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    let channel_ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
+    Ok(Json(serde_json::json!({ "channel_ids": channel_ids, "mentions": {} })))
 }
 
 pub async fn get_attachment(
