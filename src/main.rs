@@ -1,27 +1,113 @@
 use axum::{
     routing::{delete, get, patch, post},
     Router,
-    extract::{State, WebSocketUpgrade},
+    extract::{State, WebSocketUpgrade, DefaultBodyLimit},
     response::IntoResponse,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio_postgres::NoTls;
+use std::sync::{Arc, Mutex};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer, AllowOrigin};
 use tower_http::trace::TraceLayer;
 use tracing::{info, error};
 use uuid::Uuid;
 
 mod servers;
+mod voice;
 mod ws;
+
+pub type VoiceChannelBus = Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<tokio_postgres::Client>,
+    pub db: PgPool,
     pub public_url: String,
     pub ed25519_x: String,
     pub connections: Arc<RwLock<Connections>>,
+    // voice / stream state
+    pub voice_buses: VoiceChannelBus,
+    pub stream_buses: VoiceChannelBus,
+    pub stream_broadcasters: Arc<Mutex<HashMap<String, String>>>,
+    pub voice_members: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    pub voice_server_bus: broadcast::Sender<String>,
+    pub redis: redis::aio::ConnectionManager,
+    pub voice_allowed_origins: Vec<String>,
+}
+
+impl AppState {
+    pub fn voice_bus_for(&self, channel_id: &str) -> broadcast::Sender<String> {
+        let mut map = self.voice_buses.lock().unwrap();
+        map.entry(channel_id.to_string())
+            .or_insert_with(|| broadcast::channel::<String>(4096).0)
+            .clone()
+    }
+
+    pub fn stream_bus_for(&self, channel_id: &str) -> broadcast::Sender<String> {
+        let mut map = self.stream_buses.lock().unwrap();
+        map.entry(channel_id.to_string())
+            .or_insert_with(|| broadcast::channel::<String>(4096).0)
+            .clone()
+    }
+
+    pub fn claim_stream(&self, channel_id: &str, identity: &str) -> bool {
+        let mut map = self.stream_broadcasters.lock().unwrap();
+        if map.contains_key(channel_id) {
+            return false;
+        }
+        map.insert(channel_id.to_string(), identity.to_string());
+        true
+    }
+
+    pub fn release_stream(&self, channel_id: &str, identity: &str) {
+        let mut map = self.stream_broadcasters.lock().unwrap();
+        if map.get(channel_id).map(|s| s.as_str()) == Some(identity) {
+            map.remove(channel_id);
+        }
+    }
+
+    pub fn stream_broadcaster(&self, channel_id: &str) -> Option<String> {
+        self.stream_broadcasters.lock().unwrap().get(channel_id).cloned()
+    }
+
+    pub fn voice_join(&self, channel_id: &str, identity: &str) {
+        let mut rooms = self.voice_members.lock().unwrap();
+        rooms
+            .entry(channel_id.to_string())
+            .or_default()
+            .insert(identity.to_string());
+    }
+
+    pub fn voice_leave(&self, channel_id: &str, identity: &str) {
+        let mut rooms = self.voice_members.lock().unwrap();
+        if let Some(members) = rooms.get_mut(channel_id) {
+            members.remove(identity);
+            if members.is_empty() {
+                rooms.remove(channel_id);
+            }
+        }
+    }
+
+    pub fn voice_leave_all(&self, identity: &str) -> Vec<String> {
+        let mut rooms = self.voice_members.lock().unwrap();
+        let mut left = Vec::new();
+        for (channel_id, members) in rooms.iter_mut() {
+            if members.remove(identity) {
+                left.push(channel_id.clone());
+            }
+        }
+        rooms.retain(|_, members| !members.is_empty());
+        left
+    }
+
+    pub fn voice_participants(&self, channel_id: &str) -> Vec<String> {
+        let rooms = self.voice_members.lock().unwrap();
+        rooms
+            .get(channel_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Default)]
@@ -52,25 +138,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(8003);
     let zbeam_url = std::env::var("ZBEAM_URL")
         .unwrap_or_else(|_| "http://zbeam:8001".to_string());
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let voice_allowed_origins: Vec<String> = std::env::var("VOICE_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-    let (db_client, db_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&database_url)
+        .await?;
 
-    tokio::spawn(async move {
-        if let Err(e) = db_connection.await {
-            error!("Database connection error: {}", e);
-        }
-    });
-
-    init_database(&db_client).await?;
-    info!("Database initialized");
+    sqlx::migrate!().run(&pool).await?;
+    info!("Database migrations applied");
 
     let ed25519_x = fetch_ed25519_x(&zbeam_url).await;
 
+    let redis_client = redis::Client::open(redis_url.as_str())
+        .unwrap_or_else(|e| panic!("Invalid REDIS_URL '{redis_url}': {e}"));
+    let redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect to Redis at '{redis_url}': {e}"));
+    info!("Redis connected: {redis_url}");
+
+    let (voice_server_bus, _) = broadcast::channel::<String>(256);
+
     let state = AppState {
-        db: Arc::new(db_client),
+        db: pool,
         public_url,
         ed25519_x,
         connections: Arc::new(RwLock::new(Connections::default())),
+        voice_buses: Arc::new(Mutex::new(HashMap::new())),
+        stream_buses: Arc::new(Mutex::new(HashMap::new())),
+        stream_broadcasters: Arc::new(Mutex::new(HashMap::new())),
+        voice_members: Arc::new(Mutex::new(HashMap::new())),
+        voice_server_bus,
+        redis: redis_conn,
+        voice_allowed_origins,
     };
 
     let origins: Vec<axum::http::HeaderValue> = cors_origin
@@ -90,23 +197,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/servers/:id", delete(servers::delete_server))
         // Per-server v1 API (client base URL = https://cloud.zeeble.xyz/servers/:id)
         .route("/servers/:id/health",          get(servers::server_health))
-        .route("/servers/:id/v1/server/info",  get(servers::server_info))
-        .route("/servers/:id/v1/channels",     get(servers::get_channels_v1).post(servers::create_channel_v1))
-        .route("/servers/:id/v1/channels/:channel_id", patch(servers::update_channel_v1).delete(servers::delete_channel_v1))
+        .route("/servers/:id/v1/server/info",     get(servers::server_info))
+        .route("/servers/:id/v1/server/settings", get(servers::get_server_settings).patch(servers::patch_server_settings))
+        .route("/servers/:id/v1/channels",                          get(servers::get_channels_v1).post(servers::create_channel_v1))
+        .route("/servers/:id/v1/channels/unread",                   get(servers::get_unread_state))
+        .route("/servers/:id/v1/channels/:channel_id",              patch(servers::update_channel_v1).delete(servers::delete_channel_v1))
+        .route("/servers/:id/v1/channels/:channel_id/read",         post(servers::mark_channel_read))
         .route("/servers/:id/v1/members",      get(servers::get_members_v1))
         .route("/servers/:id/v1/categories",   get(servers::get_categories))
         .route("/servers/:id/v1/custom_roles", get(servers::get_custom_roles))
         .route("/servers/:id/v1/voice/rooms",  get(servers::get_voice_rooms))
         .route("/servers/:id/v1/ws",           get(ws_upgrade_handler))
         .route("/servers/:id/v1/channels/:channel_id/messages", get(servers::get_messages))
+        .route("/servers/:id/v1/messages/:message_id",          delete(servers::delete_message).patch(servers::edit_message))
+        .route("/servers/:id/v1/messages/:message_id/history",  get(servers::get_message_history))
         .route("/servers/:id/v1/channels/:channel_id/posts",    get(servers::get_board_posts))
         .route("/servers/:id/v1/channels/:channel_id/posts/:post_id/replies", get(servers::get_post_replies))
-        .route("/servers/:id/v1/upload",                        post(servers::upload_file))
+        .route("/servers/:id/v1/upload",                        post(servers::upload_file).layer(DefaultBodyLimit::max(100 * 1024 * 1024)))
         .route("/servers/:id/v1/attachments/:attach_id",        get(servers::get_attachment))
         // Invites
         .route("/servers/:id/v1/invites",                       get(servers::list_invites).post(servers::create_invite))
         .route("/servers/:id/v1/invites/:code",                 get(servers::validate_invite).delete(servers::delete_invite))
         .route("/servers/:id/v1/invites/:code/redeem",          post(servers::redeem_invite))
+        // Voice / stream (from zvoice)
+        .route("/voice/v1/ws",                              get(voice_ws_handler))
+        .route("/voice/v1/voice/rooms",                     get(voice::get_voice_rooms))
+        .route("/voice/v1/voice/participants/:channel_id",  get(voice::get_voice_participants))
+        .route("/voice/v1/streams",                         get(voice::list_streams))
+        .route("/voice/v1/stream/:channel_id",              get(voice::get_stream))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -126,6 +244,14 @@ async fn ws_upgrade_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| ws::handle_connection(socket, state, server_id))
+}
+
+async fn voice_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    voice::ws::ws_handler(ws, state, headers).await
 }
 
 async fn health() -> &'static str {
@@ -177,77 +303,4 @@ async fn fetch_ed25519_x(zbeam_url: &str) -> String {
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(std::time::Duration::from_secs(16));
     }
-}
-
-async fn init_database(db: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    db.batch_execute("
-        CREATE TABLE IF NOT EXISTS servers (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            name VARCHAR(100) NOT NULL,
-            owner_id TEXT NOT NULL,
-            about TEXT,
-            icon_url TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-
-        CREATE TABLE IF NOT EXISTS channels (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
-            name VARCHAR(100) NOT NULL,
-            channel_type TEXT NOT NULL DEFAULT 'text',
-            position INT NOT NULL DEFAULT 0,
-            topic TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-
-        CREATE TABLE IF NOT EXISTS server_members (
-            server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
-            user_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'member',
-            joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (server_id, user_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS messages (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            channel_id UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-            beam_identity TEXT NOT NULL,
-            content TEXT NOT NULL,
-            title TEXT,
-            reply_to UUID REFERENCES messages(id) ON DELETE SET NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            edited_at TIMESTAMPTZ
-        );
-
-        ALTER TABLE messages ADD COLUMN IF NOT EXISTS title TEXT;
-        ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to UUID REFERENCES messages(id) ON DELETE SET NULL;
-
-        CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to);
-
-        CREATE TABLE IF NOT EXISTS invites (
-            code TEXT PRIMARY KEY,
-            server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
-            created_by TEXT NOT NULL,
-            max_uses INTEGER,
-            use_count INTEGER NOT NULL DEFAULT 0,
-            expires_at TIMESTAMPTZ,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-
-        CREATE TABLE IF NOT EXISTS attachments (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
-            filename TEXT NOT NULL,
-            mime_type TEXT NOT NULL,
-            file_size BIGINT NOT NULL,
-            file_data BYTEA NOT NULL,
-            uploaded_by TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-
-        ALTER TABLE server_members ADD COLUMN IF NOT EXISTS display_name TEXT;
-
-        UPDATE server_members SET display_name = NULL WHERE user_id = 'd0e5b178-ddca-489e-8772-1d5246b4fcf7' AND display_name = 'creeper7';
-    ").await
 }

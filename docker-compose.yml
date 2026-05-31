@@ -15,6 +15,16 @@ services:
       - zcloud-net
     restart: unless-stopped
 
+  # ── Redis (voice / stream presence) ──────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: zcloud-redis
+    ports:
+      - "6380:6379"
+    networks:
+      - zcloud-net
+    restart: unless-stopped
+
   # ── Zcloud (Cloud Server Service) ─────────────────────────────────────────────
   zcloud:
     build:
@@ -27,10 +37,13 @@ services:
       DATABASE_URL: postgresql://zcloud_user:zcloud_password@postgres:5432/zcloud_db
       ZCLOUD_PUBLIC_URL: ${ZCLOUD_PUBLIC_URL:-https://cloud.zeeble.xyz}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      VOICE_ALLOWED_ORIGINS: ${VOICE_ALLOWED_ORIGINS:-}
       PORT: 8003
       RUST_LOG: zcloud=info,tower_http=debug
     depends_on:
       - postgres
+      - redis
     networks:
       - zcloud-net
     restart: unless-stopped
