@@ -7,8 +7,6 @@ services:
       POSTGRES_DB: zcloud_db
       POSTGRES_USER: zcloud_user
       POSTGRES_PASSWORD: zcloud_password
-    ports:
-      - "5433:5432"
     volumes:
       - zcloud_postgres_data:/var/lib/postgresql/data
     networks:
@@ -19,8 +17,6 @@ services:
   redis:
     image: redis:7-alpine
     container_name: zcloud-redis
-    ports:
-      - "6380:6379"
     networks:
       - zcloud-net
     restart: unless-stopped
