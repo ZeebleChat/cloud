@@ -208,6 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/servers/:id/v1/custom_roles", get(servers::get_custom_roles))
         .route("/servers/:id/v1/voice/rooms",  get(servers::get_voice_rooms))
         .route("/servers/:id/v1/ws",           get(ws_upgrade_handler))
+        .route("/servers/:id/v1/channels/unread",                get(servers::get_unread_channels))
+        .route("/servers/:id/v1/channels/:channel_id/read",     post(servers::mark_channel_read))
         .route("/servers/:id/v1/channels/:channel_id/messages", get(servers::get_messages))
         .route("/servers/:id/v1/messages/:message_id",          delete(servers::delete_message).patch(servers::edit_message))
         .route("/servers/:id/v1/messages/:message_id/history",  get(servers::get_message_history))
